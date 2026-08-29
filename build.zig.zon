@@ -1,0 +1,23 @@
+.{
+    .name = .otel_zig_observable_demo,
+    .version = "0.1.0",
+    .fingerprint = 0x74bc4b3d95beadd4,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        .httpz = .{
+            .url = "git+https://github.com/karlseguin/http.zig#9b14af98fde5e98abb9a8376fe02b42003e835bf",
+            .hash = "httpz-0.0.0-PNVzrMgTCQDhzfBLRRebTx9LU056Ph2erdN9-42rFbhj",
+        },
+        .opentelemetry = .{
+            .url = "git+https://github.com/open-telemetry/opentelemetry-zig#24454791d67c8468783c8b2253cd9719ee02a502",
+            .hash = "opentelemetry-0.0.1-U_uKJ4mZIgDZChXEI6RW5XBYpxGzfU3RWKi6Mi7Ps4X2",
+        },
+    },
+    .paths = .{
+        "LICENSE",
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "README.md",
+    },
+}
