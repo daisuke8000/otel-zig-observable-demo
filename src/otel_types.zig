@@ -1,4 +1,9 @@
 //! Derives observable callback types not re-exported by the SDK.
+//!
+//! The reflection chain below depends on internal signatures of the SDK
+//! commit pinned in build.zig.zon. A compile error in this file after a
+//! dependency update means an upstream signature changed; re-derive the
+//! types from the current Meter API instead of patching call sites.
 
 const sdk = @import("opentelemetry-sdk");
 
