@@ -1,6 +1,7 @@
 const std = @import("std");
 const httpz = @import("httpz");
 const Cache = @import("cache.zig").Cache;
+const CacheStats = @import("cache_stats.zig").CacheStats;
 const Telemetry = @import("telemetry.zig").Telemetry;
 
 const max_value_size = 4096;
@@ -70,7 +71,7 @@ pub const Server = struct {
 
     fn putItem(self: *Server, request: *httpz.Request, response: *httpz.Response) !void {
         const key = request.param("key").?;
-        if (!validKey(key)) {
+        if (!self.validKey(key)) {
             return respondText(response, .bad_request, "key must be 1-64 bytes using letters, numbers, - or _\n");
         }
 
@@ -84,19 +85,22 @@ pub const Server = struct {
 
     fn getItem(self: *Server, request: *httpz.Request, response: *httpz.Response) !void {
         const key = request.param("key").?;
-        if (!validKey(key)) {
+        if (!self.validKey(key)) {
             return respondText(response, .bad_request, "invalid key\n");
         }
 
-        response.body = self.cache.get(key) orelse {
+        const value = self.cache.get(key) orelse {
             return respondText(response, .not_found, "key not found\n");
         };
+        // Copy so the response never aliases cache memory that a later
+        // request could free or replace.
+        response.body = try response.arena.dupe(u8, value);
         response.content_type = .BINARY;
     }
 
     fn deleteItem(self: *Server, request: *httpz.Request, response: *httpz.Response) !void {
         const key = request.param("key").?;
-        if (!validKey(key)) {
+        if (!self.validKey(key)) {
             return respondText(response, .bad_request, "invalid key\n");
         }
         if (!self.cache.remove(key)) {
@@ -108,17 +112,17 @@ pub const Server = struct {
     fn getMetrics(self: *Server, _: *httpz.Request, response: *httpz.Response) !void {
         try response.json(try self.telemetry.collectSnapshot(), .{});
     }
-};
 
-fn validKey(key: []const u8) bool {
-    if (key.len == 0 or key.len > (Cache.Limits{}).max_key_bytes) return false;
-    for (key) |character| {
-        if (!std.ascii.isAlphanumeric(character) and character != '-' and character != '_') {
-            return false;
+    fn validKey(self: *const Server, key: []const u8) bool {
+        if (key.len == 0 or key.len > self.cache.limits.max_key_bytes) return false;
+        for (key) |character| {
+            if (!std.ascii.isAlphanumeric(character) and character != '-' and character != '_') {
+                return false;
+            }
         }
+        return true;
     }
-    return true;
-}
+};
 
 fn respondText(response: *httpz.Response, status: std.http.Status, body: []const u8) void {
     response.setStatus(status);
@@ -126,11 +130,122 @@ fn respondText(response: *httpz.Response, status: std.http.Status, body: []const
     response.body = body;
 }
 
+const TestStack = struct {
+    cache: Cache,
+    cache_stats: CacheStats,
+    telemetry: Telemetry,
+    server: Server,
+
+    fn init(self: *TestStack, limits: Cache.Limits) !void {
+        self.cache = Cache.initWithLimits(std.testing.allocator, limits);
+        errdefer self.cache.deinit();
+        self.cache_stats = CacheStats.from(&self.cache);
+        self.telemetry = try Telemetry.init(std.testing.allocator, std.testing.io, &self.cache_stats);
+        self.server = .{
+            .allocator = std.testing.allocator,
+            .io = std.testing.io,
+            .cache = &self.cache,
+            .telemetry = &self.telemetry,
+        };
+    }
+
+    fn deinit(self: *TestStack) void {
+        self.telemetry.deinit();
+        self.cache.deinit();
+    }
+};
+
 test "cache keys are deliberately simple" {
-    try std.testing.expect(validKey("language"));
-    try std.testing.expect(validKey("user_42"));
-    try std.testing.expect(!validKey(""));
-    try std.testing.expect(!validKey("a/b"));
-    try std.testing.expect(!validKey("hello world"));
-    try std.testing.expect(!validKey("a" ** 65));
+    var stack: TestStack = undefined;
+    try stack.init(.{});
+    defer stack.deinit();
+    const server = &stack.server;
+
+    try std.testing.expect(server.validKey("language"));
+    try std.testing.expect(server.validKey("user_42"));
+    try std.testing.expect(!server.validKey(""));
+    try std.testing.expect(!server.validKey("a/b"));
+    try std.testing.expect(!server.validKey("hello world"));
+    try std.testing.expect(!server.validKey("a" ** 65));
+}
+
+test "key validation follows the active cache limits" {
+    var stack: TestStack = undefined;
+    try stack.init(.{ .max_key_bytes = 4 });
+    defer stack.deinit();
+
+    try std.testing.expect(stack.server.validKey("user"));
+    try std.testing.expect(!stack.server.validKey("user2"));
+}
+
+test "store, read, and delete an item over HTTP" {
+    var stack: TestStack = undefined;
+    try stack.init(.{});
+    defer stack.deinit();
+    const server = &stack.server;
+
+    {
+        var wt = httpz.testing.init(.{});
+        defer wt.deinit();
+        wt.param("key", "language");
+        wt.body("zig");
+        try server.dispatch(Server.putItem, wt.req, wt.res);
+        try wt.expectStatusCode(.created);
+        try wt.expectBody("stored\n");
+    }
+    {
+        var wt = httpz.testing.init(.{});
+        defer wt.deinit();
+        wt.param("key", "language");
+        try server.dispatch(Server.getItem, wt.req, wt.res);
+        try wt.expectStatusCode(.ok);
+        try wt.expectBody("zig");
+    }
+    {
+        var wt = httpz.testing.init(.{});
+        defer wt.deinit();
+        wt.param("key", "language");
+        try server.dispatch(Server.deleteItem, wt.req, wt.res);
+        try wt.expectStatusCode(.no_content);
+    }
+    {
+        var wt = httpz.testing.init(.{});
+        defer wt.deinit();
+        wt.param("key", "language");
+        try server.dispatch(Server.getItem, wt.req, wt.res);
+        try wt.expectStatusCode(.not_found);
+    }
+}
+
+test "reject an invalid key over HTTP" {
+    var stack: TestStack = undefined;
+    try stack.init(.{});
+    defer stack.deinit();
+
+    var wt = httpz.testing.init(.{});
+    defer wt.deinit();
+    wt.param("key", "a/b");
+    try stack.server.dispatch(Server.putItem, wt.req, wt.res);
+    try wt.expectStatusCode(.bad_request);
+}
+
+test "report handled requests and cache state over HTTP" {
+    var stack: TestStack = undefined;
+    try stack.init(.{});
+    defer stack.deinit();
+    const server = &stack.server;
+
+    {
+        var wt = httpz.testing.init(.{});
+        defer wt.deinit();
+        wt.param("key", "language");
+        wt.body("zig");
+        try server.dispatch(Server.putItem, wt.req, wt.res);
+    }
+
+    var wt = httpz.testing.init(.{});
+    defer wt.deinit();
+    try server.dispatch(Server.getMetrics, wt.req, wt.res);
+    try wt.expectStatusCode(.ok);
+    try wt.expectJson(.{ .cache_entries = 1, .cache_bytes = 3, .requests_total = 2 });
 }
