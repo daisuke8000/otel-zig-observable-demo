@@ -6,10 +6,17 @@ const entries_metric = "cache.entries";
 const bytes_metric = "cache.bytes";
 const requests_metric = "http.requests";
 
+const lookups_metric = "cache.lookups";
+const lookup_result_attribute = "cache.result";
+const hit_result = "hit";
+const miss_result = "miss";
+
 pub const Snapshot = struct {
     cache_entries: i64 = 0,
     cache_bytes: i64 = 0,
     requests_total: i64 = 0,
+    cache_hits_total: i64 = 0,
+    cache_misses_total: i64 = 0,
 };
 
 pub const Telemetry = struct {
@@ -18,6 +25,7 @@ pub const Telemetry = struct {
     metric_reader: *otel.metrics.MetricReader,
     in_memory_exporter: *otel.metrics.InMemoryExporter,
     request_counter: *otel.metrics.Counter(u64),
+    lookup_counter: *otel.metrics.Counter(u64),
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, cache_stats: *CacheStats) !Telemetry {
         const meter_provider = try otel.metrics.MeterProvider.init(allocator, io);
@@ -77,6 +85,10 @@ pub const Telemetry = struct {
                 .name = requests_metric,
                 .description = "HTTP requests handled by the API",
             }),
+            .lookup_counter = try meter.createCounter(u64, .{
+                .name = lookups_metric,
+                .description = "Cache lookups",
+            }),
         };
     }
 
@@ -90,6 +102,14 @@ pub const Telemetry = struct {
         try self.request_counter.add(1, .{});
     }
 
+    pub fn recordCacheLookup(self: *Telemetry, hit: bool) !void {
+        const result: []const u8 = if (hit) hit_result else miss_result;
+        try self.lookup_counter.add(1, .{
+            lookup_result_attribute,
+            result,
+        });
+    }
+
     pub fn collectSnapshot(self: *Telemetry) !Snapshot {
         try self.metric_reader.collect();
 
@@ -101,9 +121,14 @@ pub const Telemetry = struct {
 
         var snapshot = Snapshot{};
         for (exported) |measurement| {
-            const value = firstIntegerValue(measurement) orelse continue;
             const name = measurement.instrumentOptions.name;
 
+            if (std.mem.eql(u8, name, lookups_metric)) {
+                collectLookupCounts(&snapshot, measurement);
+                continue;
+            }
+
+            const value = firstIntegerValue(measurement) orelse continue;
             if (std.mem.eql(u8, name, entries_metric)) {
                 snapshot.cache_entries = value;
             } else if (std.mem.eql(u8, name, bytes_metric)) {
@@ -115,6 +140,38 @@ pub const Telemetry = struct {
         return snapshot;
     }
 };
+
+fn collectLookupCounts(snapshot: *Snapshot, measurement: anytype) void {
+    switch (measurement.data) {
+        .int => |points| {
+            for (points) |point| {
+                const result = stringAttribute(point.attributes, lookup_result_attribute) orelse continue;
+
+                if (std.mem.eql(u8, result, hit_result)) {
+                    snapshot.cache_hits_total += point.value;
+                } else if (std.mem.eql(u8, result, miss_result)) {
+                    snapshot.cache_misses_total += point.value;
+                }
+            }
+        },
+        else => {},
+    }
+}
+
+fn stringAttribute(
+    attributes: anytype,
+    key: []const u8,
+) ?[]const u8 {
+    const items = attributes orelse return null;
+    for (items) |attribute| {
+        if (!std.mem.eql(u8, attribute.key, key)) continue;
+        return switch (attribute.value) {
+            .string => |value| value,
+            else => null,
+        };
+    }
+    return null;
+}
 
 fn observeEntries(
     context: otel.ObservedContext,
@@ -170,4 +227,32 @@ test "collect current cache state and cumulative request count" {
     try std.testing.expectEqual(@as(i64, 2), second.cache_entries);
     try std.testing.expectEqual(@as(i64, 7), second.cache_bytes);
     try std.testing.expectEqual(@as(i64, 2), second.requests_total);
+}
+
+test "collect cumulative cache lookup counts" {
+    const Cache = @import("cache.zig").Cache;
+
+    var cache = Cache.init(std.testing.allocator);
+    defer cache.deinit();
+
+    var cache_stats = CacheStats.from(&cache);
+    var telemetry = try Telemetry.init(
+        std.testing.allocator,
+        std.testing.io,
+        &cache_stats,
+    );
+    defer telemetry.deinit();
+
+    try telemetry.recordCacheLookup(true);
+
+    const first = try telemetry.collectSnapshot();
+    try std.testing.expectEqual(@as(i64, 1), first.cache_hits_total);
+    try std.testing.expectEqual(@as(i64, 0), first.cache_misses_total);
+
+    try telemetry.recordCacheLookup(true);
+    try telemetry.recordCacheLookup(false);
+
+    const second = try telemetry.collectSnapshot();
+    try std.testing.expectEqual(@as(i64, 2), second.cache_hits_total);
+    try std.testing.expectEqual(@as(i64, 1), second.cache_misses_total);
 }

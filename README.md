@@ -38,9 +38,12 @@ zig build run
 | --- | --- | --- |
 | `cache.entries` | `ObservableGauge` | Cached item count |
 | `cache.bytes` | `ObservableGauge` | Cached value bytes |
+| `cache.lookups` | `Counter` | Cache GET count by result |
 | `http.requests` | `Counter` | Handled request count |
 
 `GET /debug/metrics`が収集を開始し、Observable callbackが現在のキャッシュ状態を読みます。このリクエストも`http.requests`に含まれます。
+
+`cache.lookups`は`cache.result`属性（`hit`または`miss`）別に集計され、`/debug/metrics`では`cache_hits_total`と`cache_misses_total`として返されます。
 
 ## Zig patterns
 
@@ -68,9 +71,9 @@ zig build test
 
 ### Cache hit/miss metrics
 
-- [ ] `GET /items/{key}`のhitとmissを記録する
-- [ ] `/debug/metrics`へ結果を追加する
-- [ ] Counterの累計をテストする
+- [x] `GET /items/{key}`のhitとmissを記録する
+- [x] `/debug/metrics`へ結果を追加する
+- [x] Counterの累計をテストする
 
 ### Request duration
 
