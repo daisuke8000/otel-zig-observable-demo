@@ -89,9 +89,12 @@ pub const Server = struct {
             return respondText(response, .bad_request, "invalid key\n");
         }
 
-        const value = self.cache.get(key) orelse {
+        const cached_value = self.cache.get(key);
+        try self.telemetry.recordCacheLookup(cached_value != null);
+        const value = cached_value orelse {
             return respondText(response, .not_found, "key not found\n");
         };
+
         // Copy so the response never aliases cache memory that a later
         // request could free or replace.
         response.body = try response.arena.dupe(u8, value);
@@ -248,4 +251,54 @@ test "report handled requests and cache state over HTTP" {
     try server.dispatch(Server.getMetrics, wt.req, wt.res);
     try wt.expectStatusCode(.ok);
     try wt.expectJson(.{ .cache_entries = 1, .cache_bytes = 3, .requests_total = 2 });
+}
+
+test "report cache hits and misses over HTTP" {
+    var stack: TestStack = undefined;
+    try stack.init(.{});
+    defer stack.deinit();
+    const server = &stack.server;
+
+    {
+        var wt = httpz.testing.init(.{});
+        defer wt.deinit();
+        wt.param("key", "language");
+        wt.body("zig");
+
+        try server.dispatch(Server.putItem, wt.req, wt.res);
+        try wt.expectStatusCode(.created);
+    }
+
+    {
+        var wt = httpz.testing.init(.{});
+        defer wt.deinit();
+        wt.param("key", "language");
+
+        try server.dispatch(Server.getItem, wt.req, wt.res);
+        try wt.expectStatusCode(.ok);
+        try wt.expectBody("zig");
+    }
+
+    {
+        var wt = httpz.testing.init(.{});
+        defer wt.deinit();
+        wt.param("key", "missing");
+
+        try server.dispatch(Server.getItem, wt.req, wt.res);
+        try wt.expectStatusCode(.not_found);
+    }
+
+    {
+        var wt = httpz.testing.init(.{});
+        defer wt.deinit();
+        try server.dispatch(Server.getMetrics, wt.req, wt.res);
+        try wt.expectStatusCode(.ok);
+        try wt.expectJson(.{
+            .cache_entries = 1,
+            .cache_bytes = 3,
+            .requests_total = 4,
+            .cache_hits_total = 1,
+            .cache_misses_total = 1,
+        });
+    }
 }
