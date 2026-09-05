@@ -5,11 +5,16 @@ const CacheStats = @import("cache_stats.zig").CacheStats;
 const entries_metric = "cache.entries";
 const bytes_metric = "cache.bytes";
 const requests_metric = "http.requests";
+const request_duration_metric = "http.request.duration";
 
 const lookups_metric = "cache.lookups";
 const lookup_result_attribute = "cache.result";
 const hit_result = "hit";
 const miss_result = "miss";
+
+const DurationDataError = error{
+    MissingRequestDurationSum,
+};
 
 pub const Snapshot = struct {
     cache_entries: i64 = 0,
@@ -17,6 +22,8 @@ pub const Snapshot = struct {
     requests_total: i64 = 0,
     cache_hits_total: i64 = 0,
     cache_misses_total: i64 = 0,
+    request_duration_count: u64 = 0,
+    request_duration_sum_seconds: f64 = 0,
 };
 
 pub const Telemetry = struct {
@@ -26,6 +33,7 @@ pub const Telemetry = struct {
     in_memory_exporter: *otel.metrics.InMemoryExporter,
     request_counter: *otel.metrics.Counter(u64),
     lookup_counter: *otel.metrics.Counter(u64),
+    request_duration_histogram: *otel.metrics.Histogram(f64),
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, cache_stats: *CacheStats) !Telemetry {
         const meter_provider = try otel.metrics.MeterProvider.init(allocator, io);
@@ -89,6 +97,11 @@ pub const Telemetry = struct {
                 .name = lookups_metric,
                 .description = "Cache lookups",
             }),
+            .request_duration_histogram = try meter.createHistogram(f64, .{
+                .name = request_duration_metric,
+                .description = "Request duration",
+                .unit = "s",
+            }),
         };
     }
 
@@ -100,6 +113,10 @@ pub const Telemetry = struct {
 
     pub fn recordRequest(self: *Telemetry) !void {
         try self.request_counter.add(1, .{});
+    }
+
+    pub fn recordRequestDuration(self: *Telemetry, duration_seconds: f64) !void {
+        try self.request_duration_histogram.record(duration_seconds, .{});
     }
 
     pub fn recordCacheLookup(self: *Telemetry, hit: bool) !void {
@@ -121,25 +138,51 @@ pub const Telemetry = struct {
 
         var snapshot = Snapshot{};
         for (exported) |measurement| {
-            const name = measurement.instrumentOptions.name;
-
-            if (std.mem.eql(u8, name, lookups_metric)) {
-                collectLookupCounts(&snapshot, measurement);
-                continue;
-            }
-
-            const value = firstIntegerValue(measurement) orelse continue;
-            if (std.mem.eql(u8, name, entries_metric)) {
-                snapshot.cache_entries = value;
-            } else if (std.mem.eql(u8, name, bytes_metric)) {
-                snapshot.cache_bytes = value;
-            } else if (std.mem.eql(u8, name, requests_metric)) {
-                snapshot.requests_total = value;
-            }
+            try applyMeasurement(&snapshot, measurement);
         }
         return snapshot;
     }
 };
+
+fn applyMeasurement(snapshot: *Snapshot, measurement: anytype) DurationDataError!void {
+    const name = measurement.instrumentOptions.name;
+
+    if (std.mem.eql(u8, name, lookups_metric)) {
+        collectLookupCounts(snapshot, measurement);
+        return;
+    }
+
+    if (std.mem.eql(u8, name, request_duration_metric)) {
+        try collectRequestDuration(snapshot, measurement);
+        return;
+    }
+
+    const value = firstIntegerValue(measurement) orelse return;
+    const targets = [_]struct { name: []const u8, destination: *i64 }{
+        .{ .name = entries_metric, .destination = &snapshot.cache_entries },
+        .{ .name = bytes_metric, .destination = &snapshot.cache_bytes },
+        .{ .name = requests_metric, .destination = &snapshot.requests_total },
+    };
+    for (targets) |target| {
+        if (std.mem.eql(u8, name, target.name)) {
+            target.destination.* = value;
+            return;
+        }
+    }
+}
+
+fn collectRequestDuration(snapshot: *Snapshot, measurement: anytype) DurationDataError!void {
+    switch (measurement.data) {
+        .histogram => |points| {
+            for (points) |point| {
+                const sum = point.value.sum orelse return error.MissingRequestDurationSum;
+                snapshot.request_duration_count += point.value.count;
+                snapshot.request_duration_sum_seconds += sum;
+            }
+        },
+        else => {},
+    }
+}
 
 fn collectLookupCounts(snapshot: *Snapshot, measurement: anytype) void {
     switch (measurement.data) {
@@ -255,4 +298,71 @@ test "collect cumulative cache lookup counts" {
     const second = try telemetry.collectSnapshot();
     try std.testing.expectEqual(@as(i64, 2), second.cache_hits_total);
     try std.testing.expectEqual(@as(i64, 1), second.cache_misses_total);
+}
+
+test "reject request duration data with a missing sum" {
+    const Cache = @import("cache.zig").Cache;
+
+    var cache = Cache.init(std.testing.allocator);
+    defer cache.deinit();
+
+    var cache_stats = CacheStats.from(&cache);
+    var telemetry = try Telemetry.init(std.testing.allocator, std.testing.io, &cache_stats);
+    defer telemetry.deinit();
+
+    try telemetry.recordRequestDuration(0.25);
+    try telemetry.metric_reader.collect();
+
+    // Inject malformed SDK output: f64 duration histograms normally have a sum.
+    var injected_missing_sum = false;
+    for (telemetry.in_memory_exporter.data.items) |*measurement| {
+        if (!std.mem.eql(u8, measurement.instrumentOptions.name, request_duration_metric)) continue;
+        switch (measurement.data) {
+            .histogram => |points| {
+                for (points) |*point| {
+                    try std.testing.expect(point.value.sum != null);
+                    point.value.sum = null;
+                    injected_missing_sum = true;
+                }
+            },
+            else => {},
+        }
+    }
+    try std.testing.expect(injected_missing_sum);
+
+    try std.testing.expectError(error.MissingRequestDurationSum, telemetry.collectSnapshot());
+}
+
+test "collect cumulative request duration in seconds" {
+    const Cache = @import("cache.zig").Cache;
+
+    var cache = Cache.init(std.testing.allocator);
+    defer cache.deinit();
+
+    var cache_stats = CacheStats.from(&cache);
+    var telemetry = try Telemetry.init(
+        std.testing.allocator,
+        std.testing.io,
+        &cache_stats,
+    );
+    defer telemetry.deinit();
+
+    try telemetry.recordRequestDuration(0.25);
+
+    const snapshot = try telemetry.collectSnapshot();
+    try std.testing.expectEqual(@as(u64, 1), snapshot.request_duration_count);
+    try std.testing.expectApproxEqAbs(
+        @as(f64, 0.25),
+        snapshot.request_duration_sum_seconds,
+        @as(f64, 0.000001),
+    );
+
+    try telemetry.recordRequestDuration(0.5);
+    const updated_snapshot = try telemetry.collectSnapshot();
+    try std.testing.expectEqual(@as(u64, 2), updated_snapshot.request_duration_count);
+    try std.testing.expectApproxEqAbs(
+        @as(f64, 0.75),
+        updated_snapshot.request_duration_sum_seconds,
+        @as(f64, 0.000001),
+    );
 }
