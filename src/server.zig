@@ -47,6 +47,15 @@ pub const Server = struct {
         response: *httpz.Response,
     ) !void {
         try self.telemetry.recordRequest();
+        const start_time = std.Io.Timestamp.now(self.io, .awake);
+        defer {
+            const end_time = std.Io.Timestamp.now(self.io, .awake);
+            const elapsed = start_time.durationTo(end_time);
+            const duration_seconds = @as(f64, @floatFromInt(elapsed.toNanoseconds())) / 1e9;
+            self.telemetry.recordRequestDuration(duration_seconds) catch |err| {
+                std.log.warn("failed to record request duration: {s}", .{@errorName(err)});
+            };
+        }
         try action(self, request, response);
     }
 
@@ -251,6 +260,25 @@ test "report handled requests and cache state over HTTP" {
     try server.dispatch(Server.getMetrics, wt.req, wt.res);
     try wt.expectStatusCode(.ok);
     try wt.expectJson(.{ .cache_entries = 1, .cache_bytes = 3, .requests_total = 2 });
+}
+
+test "record one duration measurement per handled request" {
+    var stack: TestStack = undefined;
+    try stack.init(.{});
+    defer stack.deinit();
+    const server = &stack.server;
+
+    {
+        var wt = httpz.testing.init(.{});
+        defer wt.deinit();
+        wt.param("key", "language");
+        wt.body("zig");
+        try server.dispatch(Server.putItem, wt.req, wt.res);
+        try wt.expectStatusCode(.created);
+    }
+
+    const snapshot = try stack.telemetry.collectSnapshot();
+    try std.testing.expectEqual(@as(u64, 1), snapshot.request_duration_count);
 }
 
 test "report cache hits and misses over HTTP" {
